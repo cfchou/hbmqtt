@@ -2,7 +2,7 @@
 #
 # See the file license.txt for copying permission.
 
-class HBMQTTException(BaseException):
+class HBMQTTException(Exception):
     """
     HBMQTT base exception
     """

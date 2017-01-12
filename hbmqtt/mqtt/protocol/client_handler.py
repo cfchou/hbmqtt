@@ -21,6 +21,7 @@ from hbmqtt.mqtt.connect import ConnectVariableHeader, ConnectPayload, ConnectPa
 from hbmqtt.mqtt.connack import ConnackPacket
 from hbmqtt.session import Session
 from hbmqtt.plugins.manager import PluginManager
+import itertools
 
 
 class ClientProtocolHandler(ProtocolHandler):
@@ -50,6 +51,12 @@ class ClientProtocolHandler(ProtocolHandler):
         if not self._disconnect_waiter.done():
             self._disconnect_waiter.cancel()
         self._disconnect_waiter = None
+        self.logger.debug("Stopping %d suback waiters" % len(self._subscriptions_waiter))
+        self.logger.debug("Stopping %d unsuback waiters" % len(self._unsubscriptions_waiter))
+        for waiter in itertools.chain(
+            self._subscriptions_waiter.values(),
+            self._unsubscriptions_waiter.values()):
+            waiter.cancel()
 
     def _build_connect_packet(self):
         vh = ConnectVariableHeader()
