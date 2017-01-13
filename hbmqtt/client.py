@@ -6,7 +6,7 @@ import logging
 import ssl
 from urllib.parse import urlparse, urlunparse
 from functools import wraps
-
+from asyncio import CancelledError
 from hbmqtt.utils import not_in_dict_or_none
 from hbmqtt.session import Session
 from hbmqtt.mqtt.connack import *
@@ -105,6 +105,7 @@ class MQTTClient:
         self._handler = None
         self._disconnect_task = None
         self._connected_state = asyncio.Event()
+        self._bye = False
 
         # Init plugins manager
         context = ClientContext()
@@ -141,8 +142,8 @@ class MQTTClient:
 
         try:
             return (yield from self._do_connect())
-        except BaseException as be:
-            self.logger.warning("Connection failed: %r" % be)
+        except Exception as e:
+            self.logger.warning("Connection failed: %r" % e)
             auto_reconnect = self.config.get('auto_reconnect', False)
             if not auto_reconnect:
                 raise
@@ -158,9 +159,12 @@ class MQTTClient:
 
             This method is a *coroutine*.
         """
-
+        while self.client_tasks:
+            self.client_tasks.popleft().set_exception(ClientException("Connection lost"))
+        self._bye = True
         if self.session.transitions.is_connected():
             if not self._disconnect_task.done():
+                # cancel handle_connection_close()
                 self._disconnect_task.cancel()
             yield from self._handler.mqtt_disconnect()
             self._connected_state.clear()
@@ -332,6 +336,7 @@ class MQTTClient:
         self.logger.debug("Waiting message delivery")
         done, pending = yield from asyncio.wait([deliver_task], loop=self._loop, return_when=asyncio.FIRST_EXCEPTION, timeout=timeout)
         if deliver_task in done:
+            # can be set_exception(ClientException("Connection lost"))
             self.client_tasks.pop()
             return deliver_task.result()
         else:
@@ -430,32 +435,44 @@ class MQTTClient:
 
     @asyncio.coroutine
     def handle_connection_close(self):
-        self.logger.debug("Watch broker disconnection")
-        # Wait for disconnection from broker (like connection lost)
-        yield from self._handler.wait_disconnect()
-        self.logger.warning("Disconnected from broker")
+        try:
+            self.logger.debug("Watch broker disconnection")
+            # Wait for disconnection from broker (like connection lost)
+            yield from self._handler.wait_disconnect()
+            self.logger.warning("Disconnected from broker")
 
-        # Block client API
-        self._connected_state.clear()
+            # Block client API
+            self._connected_state.clear()
 
-        # stop an clean handler
-        #yield from self._handler.stop()
-        self._handler.detach()
-        self.session.transitions.disconnect()
+            # stop an clean handler
+            #yield from self._handler.stop()
+            self._handler.detach()
+            self.session.transitions.disconnect()
 
-        if self.config.get('auto_reconnect', False):
-            # Try reconnection
-            self.logger.debug("Auto-reconnecting")
-            try:
-                yield from self.reconnect()
-            except ConnectException:
+            if self.config.get('auto_reconnect', False):
+                # Try reconnection
+                self.logger.debug("Auto-reconnecting")
+                try:
+                    yield from self.reconnect()
+                except CancelledError as e:
+                    # cancelled caused by disconnect(), handle later
+                    raise
+                except Exception as e:
+                    self.logger.exception(e)
+                    # Cancel client pending tasks
+                    while self.client_tasks:
+                        self.client_tasks.popleft().set_exception(ClientException("Connection lost"))
+                    self._bye = True
+            else:
                 # Cancel client pending tasks
+                self.logger.debug('handle_connection_close no auto_reconnect')
                 while self.client_tasks:
                     self.client_tasks.popleft().set_exception(ClientException("Connection lost"))
-        else:
-            # Cancel client pending tasks
-            while self.client_tasks:
-                self.client_tasks.popleft().set_exception(ClientException("Connection lost"))
+                self._bye = True
+        except CancelledError:
+            self.logger.info('cancelled caused by disconnect()')
+            assert(self._bye)
+            raise
 
     def _initsession(
             self,

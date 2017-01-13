@@ -82,7 +82,7 @@ class ProtocolHandler:
             self.keepalive_timeout = None
 
     def attach(self, session, reader: ReaderAdapter, writer: WriterAdapter):
-        if self.session:
+        if self._is_attached():
             raise ProtocolHandlerException("Handler is already attached to a session")
         self._init_session(session)
         self.reader = reader
