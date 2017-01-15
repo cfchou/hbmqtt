@@ -62,6 +62,7 @@ class ProtocolHandler:
             self._loop = asyncio.get_event_loop()
         else:
             self._loop = loop
+        self._reader_cond = asyncio.Condition()
         self._reader_task = None
         self._keepalive_task = None
         self._reader_ready = None
@@ -100,12 +101,73 @@ class ProtocolHandler:
             return False
 
     @asyncio.coroutine
+    def _reader_loop2(self):
+        try:
+            while True:
+                try:
+                    self._reader_ready.set()
+                except MQTTException:
+                    raise
+                except asyncio.CancelledError:
+                    self.logger.debug("Task cancelled, reader loop ending")
+                    break
+            yield from self.handle_connection_closed()
+            self._reader_stopped.set()
+            yield from self.stop()
+        finally:
+            self.logger.debug("%s Reader coro stopped" % self.session.client_id)
+            self._reader_ready.set()
+            self._reader_stopped.set()
+            yield from self.stop()
+
+        while True:
+            try:
+                self._reader_ready.set()
+            except MQTTException:
+                self.logger.debug("Message discarded")
+                # swallowed
+            except asyncio.CancelledError:
+                self.logger.debug("Task cancelled, reader loop ending")
+                break
+        yield from self.handle_connection_closed()
+        self._reader_stopped.set()
+        self.logger.debug("%s Reader coro stopped" % self.session.client_id)
+        yield from self.stop()
+
+    @asyncio.coroutine
     def start(self):
+        with (yield from self._reader_cond):
+            try:
+                if not self._is_attached():
+                    raise ProtocolHandlerException("Handler is not attached to a stream")
+                if self._keepalive_task or self._reader_task:
+                    self.logger.warn('start() before, should await stop()')
+                    return
+                self._reader_ready = asyncio.Event(loop=self._loop)
+                self._reader_task = asyncio.Task(self._reader_loop(), loop=self._loop)
+                # ensure ping_resp will be handled
+                yield from self._reader_ready.wait()
+                if self.keepalive_timeout:
+                    self._keepalive_task = self._loop.call_later(self.keepalive_timeout, self.handle_write_timeout)
+                self.logger.debug("Handler tasks started")
+                yield from self._retry_deliveries()
+                self.logger.debug("Handler ready")
+            except Exception as e:
+                if self._keepalive_task:
+                    self._keepalive_task.cancel()
+                if self._reader_task and not self._reader_task.done():
+                    self._reader_task.cancel()
+                self._keepalive_task = None
+                self._reader_task = None
+            finally:
+                pass
+
         if not self._is_attached():
             raise ProtocolHandlerException("Handler is not attached to a stream")
         self._reader_ready = asyncio.Event(loop=self._loop)
         self._reader_task = asyncio.Task(self._reader_loop(), loop=self._loop)
-        yield from asyncio.wait([self._reader_ready.wait()], loop=self._loop)
+        #yield from asyncio.wait([self._reader_ready.wait()], loop=self._loop)
+        yield from self._reader_ready.wait()
         if self.keepalive_timeout:
             self._keepalive_task = self._loop.call_later(self.keepalive_timeout, self.handle_write_timeout)
 
@@ -115,6 +177,17 @@ class ProtocolHandler:
 
     @asyncio.coroutine
     def stop(self):
+        with (yield from self._reader_cond):
+            if self._keepalive_task
+            # Stop messages flow waiter
+            self._stop_waiters()
+            if self._keepalive_task:
+                self._keepalive_task.cancel()
+            if self._reader_task and not self._reader_task.done():
+                self._reader_task.cancel()
+
+            yield from self._reader_stopped.wait()
+
         # Stop messages flow waiter
         self._stop_waiters()
         if self._keepalive_task:
@@ -122,8 +195,9 @@ class ProtocolHandler:
         self.logger.debug("waiting for tasks to be stopped")
         if not self._reader_task.done():
             self._reader_task.cancel()
-            yield from asyncio.wait(
-                [self._reader_stopped.wait()], loop=self._loop)
+            #yield from asyncio.wait(
+            #    [self._reader_stopped.wait()], loop=self._loop)
+            yield from self._reader_stopped.wait()
         self.logger.debug("closing writer")
         try:
             yield from self.writer.close()
@@ -352,7 +426,6 @@ class ProtocolHandler:
                 app_message.pubcomp_packet = pubcomp_packet
             except asyncio.CancelledError:
                 self.logger.debug("Message flow cancelled")
-
 
     @asyncio.coroutine
     def _reader_loop(self):
